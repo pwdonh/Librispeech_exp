@@ -1,6 +1,5 @@
 import numpy as np
 import torch
-import matplotlib.pyplot as plt
 import sys, os
 sys.path.append('./torchaudio-contrib')
 # sys.path.append('audio')
@@ -189,10 +188,11 @@ test_loader = DataLoader(test_dataset, num_workers=1, batch_sampler=test_sampler
 model = SpecNet()
 
 mel = tac.layers.Melspectrogram(128, train_dataset.sample_rate, hop=int(.01*train_dataset.sample_rate), n_fft=2**10)
-modfilter = ModFilter(None, 5)
+modfilter = ModFilter(7, None)
 if args.cuda:
     model.cuda()
     mel = mel.cuda()
+    modfilter = modfilter.cuda()
     device = torch.device("cuda:0")
 else:
     device = torch.device("cpu")
@@ -221,7 +221,7 @@ for epoch in range(100):
         spec = mel(y)
         spec = tac.scaling.amplitude_to_db(spec)
 
-        if False:
+        if True:
             spec = modfilter(spec)
 
         out = model(spec)
@@ -258,7 +258,7 @@ for epoch in range(100):
         spec = mel(y)
         spec = tac.scaling.amplitude_to_db(spec)
 
-        if False:
+        if True:
             spec = modfilter(spec)
 
         out = model(spec)
@@ -273,5 +273,5 @@ for epoch in range(100):
 
     if (epoch==0) or (avg_loss/i < best_val_loss):
         best_val_loss = avg_loss/i
-        with open('./spec_net_1.pkl', 'wb') as f:
+        with open('./spec_net_temp7.pkl', 'wb') as f:
             torch.save(model.state_dict(), f)
