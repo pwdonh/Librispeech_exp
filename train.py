@@ -1,34 +1,112 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+# In[1]:
+
+
+# cd speechsamples/voxceleb_exp
+
+
+# In[76]:
+
+
 import numpy as np
 import torch
-import sys, os
-sys.path.append('./torchaudio-contrib')
-# sys.path.append('audio')
-# sys.path.append('audio/torchaudio')
+# import matplotlib.pyplot as plt
 import torchaudio
+import sys, os
+sys.path.append('torchaudio-contrib')
 import tac
 from torch import nn, optim
 from time import time
 from torch.utils.data.sampler import Sampler
 from torch.utils.data import DataLoader
+from models import *
+
 import argparse
+
+import logging
 
 parser = argparse.ArgumentParser(description='DeepSpeech training')
 parser.add_argument('--basepath', metavar='DIR',
-        help='path to train manifest csv', default='/meg/meg1/users/peterd/')
+                    help='path to train manifest csv',
+                    default='/export02/data/peterd//Projects/speechsamples/Librispeech_exp/data/')
 parser.add_argument('--train-manifest', metavar='DIR',
-        help='path to train manifest csv', default='./data/identification_train.csv')
+                    help='path to train manifest csv', default='./data/identification_train.csv')
 parser.add_argument('--test-manifest', metavar='DIR',
-        help='path to test manifest csv', default='./data/identification_test.csv')
+                    help='path to test manifest csv', default='./data/identification_test.csv')
 parser.add_argument('--lrate', type=float,
-        help='path to test manifest csv', default=1e-3)
+                    help='path to test manifest csv', default=1e-3)
+parser.add_argument('--n-future-p', type=int,
+                    help='path to test manifest csv', default=1)
+parser.add_argument('--n-future-w', type=int,
+                    help='path to test manifest csv', default=0)
+parser.add_argument('--speakers', type=int,
+                    help='path to test manifest csv', default=0)
+parser.add_argument('--cutoff-temp', type=int,
+                    help='path to test manifest csv', default=0)
+parser.add_argument('--cutoff-spec', type=int,
+                    help='path to test manifest csv', default=0)
+parser.add_argument('--rndseed', type=int,
+                    help='path to test manifest csv', default=20102018)
 parser.add_argument('--cuda', dest='cuda', action='store_true', help='Use cuda to train model')
 args = parser.parse_args()
 
-# basepath = '/local_raid/data/peterd'
+# basepath = '/export02/data/peterd/Projects/speechsamples/Librispeech_exp/data/'
+# lr0 = 1e-3
+# cutoff_temp = 0
+# cutoff_spec = 2
+# cuda = False
+# n_future_p = 1
+# n_future_w = 0
+# speakers = False
+# rndseed = 20102018
 basepath = args.basepath
+lr0 = args.lrate
+n_future_p = args.n_future_p
+n_future_w = args.n_future_w
+speakers = args.speakers
+cutoff_temp = args.cutoff_temp
+cutoff_spec = args.cutoff_spec
+cuda = args.cuda
+rndseed = args.rndseed
+
 manifest_filepath = './converted_aligned_phones.txt'
 librispeech_path = basepath+'/LibriSpeech/train-clean-100/'
-lr0 = args.lrate
+n_phones = 41
+n_words = 7727
+grad_clip = 1.
+
+torch.manual_seed(rndseed)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+np.random.seed(rndseed)
+
+experiment_string = 'lr_{}_nfuturep_{}_nfuturew_{}_speakers_{}_ctemp_{}_cspec_{}_0'.format(
+    int(lr0*10000), n_future_p, n_future_w, speakers, cutoff_temp, cutoff_spec)
+ii = 1
+while os.path.isfile('log_'+experiment_string+'.log'):
+    experiment_string = experiment_string[:-1]+str(ii)
+    ii +=1
+logging.basicConfig(filename='log_{}.log'.format(experiment_string), filemode='w', format='%(name)s - %(levelname)s - %(message)s',
+                    level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+logger.info(args)
+
+# basepath = '/local_raid/data/peterd'
+manifest_filepath = './data/converted_aligned_phones.txt'
+manifest_filepath_p = './data/alignments_wordcount8_phones.txt'
+manifest_filepath_w = './data/alignments_wordcount8_words.txt'
+
+# Sort speaker ids, make index
+pids = np.sort([int(pid) for pid in os.listdir(librispeech_path)])
+pid_index = torch.LongTensor(np.zeros(pids.max()+1, dtype=int))
+for i_pid, pid in enumerate(pids):
+    pid_index[pid] = i_pid
+
+# In[83]:
+
 
 from torch.utils.data import Dataset
 
@@ -36,30 +114,69 @@ def get_librispeech_filepath(librispeech_path, filecode):
     fparts = filecode.split('-')
     return os.path.join(librispeech_path, fparts[0], fparts[1], filecode+'.flac')
 
+def compute_next_items(phones, words):
+
+    phones2 = torch.ones_like(phones)
+    phones3 = torch.ones_like(phones)
+    words2 = torch.ones_like(words)
+
+    curr_phone = phones[0].item()
+    curr_word = words[0].item()
+    w_break = 0
+    p_break = 0
+    for i_p in range(1,len(phones)):
+        if not (words[i_p].item()==curr_word):
+            words2[range(w_break,i_p)] = words[i_p].item()
+            w_break = i_p
+            curr_word = words[i_p].item()
+        if not (phones[i_p].item()==curr_phone):
+            phones2[range(p_break,i_p)] = phones[i_p].item()
+            p_break = i_p
+            curr_phone = phones[i_p].item()
+
+    curr_phone = phones2[0].item()
+    p_break = 0
+    for i_p in range(1,len(phones)):
+        if not (phones2[i_p].item()==curr_phone):
+            phones3[range(p_break,i_p)] = phones2[i_p].item()
+            p_break = i_p
+            curr_phone = phones2[i_p].item()
+
+    return phones2, phones3, words2
+
 class LibriSpeechDataset(Dataset):
-    def __init__(self, manifest_filepath, librispeech_path, chunk=None, index=None, sample_rate=16000, normalize=True):
+    def __init__(self, manifest_filepath, librispeech_path, chunk=None, index=None, sample_rate=16000,
+                 normalize=True, train=True, manifest_filepath_w=None):
         """
         """
         with open(manifest_filepath) as f:
             afiles = f.readlines()
+        if manifest_filepath_w is not None:
+            with open(manifest_filepath_w) as f:
+                afiles_w = f.readlines()
         files = []
-        for afile in afiles:
+        # print(len(afiles))
+        for i_file, afile in enumerate(afiles):
+            # print(i_file)
             asplit = afile.split(' ')
             filecode = asplit[0]
             speaker_id = int(filecode.split('-')[0])
             phones = torch.LongTensor([int(phone) for phone in asplit[1:]])
+            asplit_w = afiles_w[i_file].split(' ')
+            words = torch.LongTensor([int(word)-1 for word in asplit_w[1:]])
+            # phones2, phones3, words2 = compute_next_items(phones, words)
             audiolen = len(phones)*.01
             if len(phones)<=(chunk*100+1):
                 continue
             else:
-                files.append([filecode, speaker_id, phones, audiolen])
+                files.append([filecode, speaker_id, phones, phones, phones, audiolen, words, words])
         if index is None:
             self.files = files
         else:
             self.files = [files[ii] for ii in index]
         self.size = len(self.files)
         self.librispeech_path = librispeech_path
-        self.train = True
+        self.train = train
         self.sample_rate = sample_rate
         self.normalize = normalize
         self.chunk = chunk
@@ -73,18 +190,24 @@ class LibriSpeechDataset(Dataset):
 
     def __getitem__(self, index):
         sample = self.files[index]
-        filecode, speaker_id, phones, audiolen = sample[0], sample[1], sample[2], sample[3]
+        filecode, speaker_id, phones, phones2, phones3, audiolen, words, words2 = tuple(sample)
+        # filecode, speaker_id, phones, audiolen, words = sample[0], sample[1], sample[2], sample[3], sample[4]
         # index 3 second window
         if self.chunk is not None:
-            offset = np.random.uniform(0, float(audiolen)-self.chunk)
-            offset = int(np.floor(offset*100))
+            if self.train:
+                offset = np.random.uniform(0, float(audiolen)-self.chunk)
+                offset = int(np.floor(offset*100))
+            else:
+                offset = 0
             index_phones = np.arange(offset, offset+int(self.chunk*100)+1)
             offset = offset*(self.sample_rate/100)
             index = np.arange(offset, offset+self.sample_rate*self.chunk)
         else:
             index = None
+        # phones2, phones3, words2 = compute_next_items(phones, words)
         y = self.parse_audio(get_librispeech_filepath(self.librispeech_path, filecode), index=index)
-        target = (speaker_id, phones[index_phones])
+        target = (pid_index[speaker_id], phones[index_phones], phones2[index_phones], phones3[index_phones],
+                  words[index_phones], words2[index_phones])
         return y, target
 
     def __len__(self):
@@ -98,19 +221,17 @@ class ModFilter(nn.Module):
         self.spectral = spectral
 
     def forward(self, x):
-        print(x.shape)
         spec_fft = torch.rfft(x, 2)
-        print(spec_fft.shape)
-        spec_fft_abs = np.sqrt(spec_fft[:,:,:,:,0]**2+spec_fft[:,:,:,:,1]**2)
-        gainmap = torch.zeros(spec_fft.shape[:4])
-        if self.temporal is not None:
-            gainmap[0,0,:,:self.temporal] = 1
-            gainmap[0,0,:,self.temporal] = .5
-        if self.spectral is not None:
-            gainmap[0,0,:self.spectral,:] = 1
-            gainmap[0,0,self.spectral,:] = .5
-            gainmap[0,0,-self.spectral:,:] = 1
-            gainmap[0,0,-self.spectral,:] = .5
+        spec_fft_abs = torch.sqrt(spec_fft[:,:,:,:,0]**2+spec_fft[:,:,:,:,1]**2)
+        gainmap = torch.torch.zeros_like(spec_fft[:,:,:,:,0])
+        if self.temporal is not 0:
+            gainmap[:,0,:,:self.temporal] = 1
+            gainmap[:,0,:,self.temporal] = .5
+        if self.spectral is not 0:
+            gainmap[:,0,:self.spectral,:] = 1
+            gainmap[:,0,self.spectral,:] = .5
+            gainmap[:,0,-self.spectral:,:] = 1
+            gainmap[:,0,-self.spectral,:] = .5
         spec_fft_new = spec_fft*gainmap[:,:,:,:,None].repeat(1,1,1,1,2)
         spec_new = torch.irfft(spec_fft_new, 2)
         return spec_new
@@ -137,59 +258,60 @@ class BucketingSampler(Sampler):
     def shuffle(self, epoch):
         np.random.shuffle(self.bins)
 
-class SpecNet(nn.Module):
+def amplitude_to_db(x, ref=1.0, amin=1e-7):
+    """
+    Note: Given that FP32 is used and its corresponding `amin`,
+    we do not implement further numerical stabilization for very small inputs.
+    :param x: torch.tensor, the input value
+    :param ref:
+    :param amin: float
+    :return: torch.tensor, same size of x, but decibel-scaled
+    """
+    x = torch.clamp(x, min=amin)
+    return 10.0 * (torch.log10(x) - torch.log10(torch.tensor(ref, device=x.device, requires_grad=False)))
 
-    def __init__(self, embed_size=256):
-        super(SpecNet, self).__init__()
-#         self.mel = tac.layers.Melspectrogram(128, 16000, n_fft=2**9)
-#         self.lnorm = torch.nn.LayerNorm((1,128,376))
-#         self.n_future = 12
-        self.convnet = nn.Sequential(
-            nn.Conv2d(1, 64, kernel_size=(128,1), stride=1,
-                                   bias=False),
-            nn.BatchNorm2d(64),
-            nn.LeakyReLU(),
-            nn.Conv2d(64, 128, kernel_size=(1,3), stride=1,
-                                   bias=False),
-            nn.BatchNorm2d(128),
-            nn.LeakyReLU(),
-            nn.Conv2d(128, embed_size, kernel_size=(1,3), stride=1,
-                                   bias=False),
-            nn.BatchNorm2d(embed_size),
-            nn.LeakyReLU()
-            )
-        self.gru = nn.GRU(input_size=embed_size, hidden_size=embed_size)
-        self.lin = nn.Linear(embed_size, 41)
+# ==== Load data ==== #
 
-    def forward(self, data):
-#         spec = self.lnorm(self.mel(data))
-        conv_out = self.convnet(spec)
-        gru_in = conv_out[:,:,0,:].transpose(1,2).transpose(0,1)
-        gru_out = self.gru(gru_in)[0]
-        prediction = self.lin(gru_out).transpose(0,1).transpose(1,2)
-        return prediction
-
-train_dataset = LibriSpeechDataset(manifest_filepath, librispeech_path, 3, index=None)
+train_dataset = LibriSpeechDataset(manifest_filepath_p, librispeech_path, 3, index=None,
+                                   manifest_filepath_w=manifest_filepath_w)
 n_files = len(train_dataset)
 
+rand = np.random.RandomState(123456)
 file_index = np.arange(n_files)
-np.random.shuffle(file_index)
+rand.shuffle(file_index)
 test_index = file_index[-640:]
 train_index = file_index[:-640]
 
 batch_size = 64
-train_dataset = LibriSpeechDataset(manifest_filepath, librispeech_path, 3, index=train_index)
+train_dataset = LibriSpeechDataset(manifest_filepath_p, librispeech_path, 3, index=train_index,
+                                   manifest_filepath_w=manifest_filepath_w)
 train_sampler = BucketingSampler(train_dataset, batch_size=batch_size)
 train_loader = DataLoader(train_dataset, num_workers=1, batch_sampler=train_sampler)
-test_dataset = LibriSpeechDataset(manifest_filepath, librispeech_path, 3, index=test_index)
+test_dataset = LibriSpeechDataset(manifest_filepath_p, librispeech_path, 3, index=test_index, train=False,
+                                  manifest_filepath_w=manifest_filepath_w)
 test_sampler = BucketingSampler(test_dataset, batch_size=batch_size)
 test_loader = DataLoader(test_dataset, num_workers=1, batch_sampler=test_sampler)
 
-model = SpecNet()
+# ==== Load model ==== #
+
+if speakers==1:
+    n_s = len(pids)
+elif speakers==0:
+    n_s = 0
+if n_future_w>0:
+    model = SpecNetPW(embed_size=256, n_p=41, n_future_p=n_future_p, n_w=7727, n_future_w=n_future_w, n_s=n_s)
+else:
+    model = SpecNetP(embed_size=256, n_p=41, n_future_p=n_future_p, n_s=n_s)
+
+logger.info(model)
 
 mel = tac.layers.Melspectrogram(128, train_dataset.sample_rate, hop=int(.01*train_dataset.sample_rate), n_fft=2**10)
-modfilter = ModFilter(7, None)
-if args.cuda:
+modfilter = ModFilter(cutoff_temp, cutoff_spec)
+if (cutoff_spec==0) and (cutoff_temp==0):
+    is_modfilter = False
+else:
+    is_modfilter = True
+if cuda:
     model.cuda()
     mel = mel.cuda()
     modfilter = modfilter.cuda()
@@ -197,81 +319,94 @@ if args.cuda:
 else:
     device = torch.device("cpu")
 
-ce_loss = nn.CrossEntropyLoss()
+# ==== Training ==== #
 
 optimizer = optim.Adam(model.parameters(), lr=lr0)
 n_batch = int(len(train_dataset)/batch_size)
 
-train_loss = []
-test_loss = []
-accuracies = []
-for epoch in range(100):
-    train_loss.append([])
+train_loss, test_loss, test_accuracy = ([], [], [])
+best_val_losses = [0. for ii in range(model.n_losses)]
+for epoch in range(70):
+    logger.info('Epoch {}'.format(epoch))
+    [l.append([]) for l in [train_loss, test_loss, test_accuracy]]
+
     model.train()
-    avg_loss = 0.
+    avg_losses = [0. for ii in range(model.n_losses)]
     epoch_start = time()
     train_sampler.shuffle(epoch)
+
     for i, (data) in enumerate(train_loader, start=0):
 
-        print('Epoch {}, Batch {} of {}'.format(epoch, i, n_batch))
-        data = (data[0].to(device), (data[1][0].to(device), data[1][1].to(device)))
-
-        y, (speaker_id, phones) = data
-
+        data = (data[0].to(device), tuple([d.to(device) for d in data[1]]))
+        # get audio signal and multiple targets
+        y, targets = data
+        # compute mel-spectrogram
         spec = mel(y)
-        spec = tac.scaling.amplitude_to_db(spec)
-
-        if True:
+        spec = amplitude_to_db(spec)
+        # apply modulation filter
+        if is_modfilter:
             spec = modfilter(spec)
-
+        # run through CNN/RNN
         out = model(spec)
-        loss = ce_loss(out, phones[:,2:-2])
-        avg_loss += loss.item()
-
-        # compute gradient
+        # compute losses
+        losses = model.loss(out, targets)
+        avg_losses = [al+l.item() for al, l  in zip(avg_losses, losses)]
+        # compute gradient wrt summed losses
         optimizer.zero_grad()
-        loss.backward()
+        sum(losses).backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        optimizer.step()
 
-        # if False:
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.)
+        if (i>0) and (i%20==0):
+            logger.info('Batch {} of {}'.format(i, n_batch))
+            for i_loss, avg_loss in enumerate(avg_losses):
+                logger.info('Average loss {}: {}'.format(i_loss, avg_loss/i))
+            logger.info('Elapsed time: {} seconds'.format(time()-epoch_start))
 
-        # torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_norm)
-        if True:
-            optimizer.step()
-
-        if (i>0) and (i%50==0):
-            print('Average loss: {}'.format(avg_loss/i))
-            print('Elapsed time: {} seconds'.format(time()-epoch_start))
-            train_loss[-1].append(avg_loss/i)
+    for i_loss, avg_loss in enumerate(avg_losses):
+        train_loss[-1].append(avg_loss/i)
 
     model.eval()
-    avg_loss = 0.
-    accuracy = 0.
+    avg_losses = [0. for ii in range(model.n_losses)]
+    avg_accuracies = [0. for ii in range(model.n_losses)]
     epoch_start = time()
-    print('Testing..')
+    logger.info('Testing..')
     for i, (data) in enumerate(test_loader, start=0):
 
-        print(i)
-        data = (data[0].to(device), (data[1][0].to(device), data[1][1].to(device)))
-        y, (speaker_id, phones) = data
-
+        logger.info(i)
+        data = (data[0].to(device), tuple([d.to(device) for d in data[1]]))
+        y, targets = data
         spec = mel(y)
-        spec = tac.scaling.amplitude_to_db(spec)
-
-        if True:
+        spec = amplitude_to_db(spec)
+        if is_modfilter:
             spec = modfilter(spec)
-
         out = model(spec)
-        loss = ce_loss(out, phones[:,2:-2])
-        accuracy += torch.sum(out.argmax(1) == phones[:,2:-2]).item() / (batch_size*(phones.shape[1]-4))
-        avg_loss += loss.item()
+        losses = model.loss(out, targets)
+        accuracies = model.accuracy(out, targets)
+        avg_losses = [al+l.item() for al, l  in zip(avg_losses, losses)]
+        avg_accuracies = [aa+a for aa, a  in zip(avg_accuracies, accuracies)]
 
-    test_loss.append(avg_loss/i)
-    accuracies.append(accuracy/i)
-    print('Test loss: {}'.format(avg_loss/i))
-    print('Test accuracy: {}'.format(accuracy/i))
+    is_best = False
+    for i_loss, (avg_loss, avg_accuracy) in enumerate(zip(avg_losses, avg_accuracies)):
+        logger.info('Test loss {}: {}'.format(i_loss, avg_loss/(i+1)))
+        logger.info('Test accuracy {}: {}'.format(i_loss, avg_accuracy/(i+1)))
+        test_loss[-1].append(avg_loss/(i+1))
+        test_accuracy[-1].append(avg_accuracy/(i+1))
+        if (epoch==0) or (avg_loss/(i+1) < best_val_losses[i_loss]):
+            best_val_losses[i_loss] = avg_loss/(i+1)
+            is_best = True
 
-    if (epoch==0) or (avg_loss/i < best_val_loss):
-        best_val_loss = avg_loss/i
-        with open('./spec_net_temp7.pkl', 'wb') as f:
+    if is_best:
+        logger.info('Saving model')
+        with open('./state_dict_{}.pkl'.format(experiment_string), 'wb') as f:
             torch.save(model.state_dict(), f)
+    else:
+        lr0 /= 4
+        logger.info('Decreasing learning rate: {}'.format(lr0))
+        for g in optimizer.param_groups:
+            g['lr'] /= 4
+
+np.savez('./results_{}.npz'.format(experiment_string),
+    train_loss=np.array(train_loss),
+    test_loss=np.array(test_loss),
+    test_accuracy=np.array(test_accuracy))
