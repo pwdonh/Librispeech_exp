@@ -420,10 +420,10 @@ for epoch in range(70):
 # Test
 avg_losses, avg_accuracies, i = evaluate(test_loader)
 for i_loss in range(len(avg_losses)):
-    logger.info('Test loss {}: {}'.format(i_loss, avg_loss/(i+1)))
-    logger.info('Test accuracy {}: {}'.format(i_loss, avg_accuracy/(i+1)))
     avg_losses[i_loss] = avg_losses[i_loss]/(i+1)
     avg_accuracies[i_loss] = avg_accuracies[i_loss]/(i+1)
+    logger.info('Test loss {}: {}'.format(i_loss, avg_losses[i_loss]))
+    logger.info('Test accuracy {}: {}'.format(i_loss, avg_accuracies[i_loss]))    
             
 np.savez('./results_{}.npz'.format(experiment_string),
     train_loss=np.array(train_loss),
