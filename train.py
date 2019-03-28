@@ -270,6 +270,28 @@ def amplitude_to_db(x, ref=1.0, amin=1e-7):
     x = torch.clamp(x, min=amin)
     return 10.0 * (torch.log10(x) - torch.log10(torch.tensor(ref, device=x.device, requires_grad=False)))
 
+def evaluate(loader):  
+    model.eval()
+    avg_losses = [0. for ii in range(model.n_losses)]
+    avg_accuracies = [0. for ii in range(model.n_losses)]
+    epoch_start = time()
+    logger.info('Testing..')
+    for i, (data) in enumerate(val_loader, start=0):
+
+        logger.info(i)
+        data = (data[0].to(device), tuple([d.to(device) for d in data[1]]))
+        y, targets = data
+        spec = mel(y)
+        spec = amplitude_to_db(spec)
+        if is_modfilter:
+            spec = modfilter(spec)
+        out = model(spec)
+        losses = model.loss(out, targets)
+        accuracies = model.accuracy(out, targets)
+        avg_losses = [al+l.item() for al, l  in zip(avg_losses, losses)]
+        avg_accuracies = [aa+a for aa, a  in zip(avg_accuracies, accuracies)]
+    return avg_losses, avg_accuracies, i
+  
 # ==== Load data ==== #
 
 train_dataset = LibriSpeechDataset(manifest_filepath_p, librispeech_path, 3, index=None,
@@ -279,14 +301,21 @@ n_files = len(train_dataset)
 rand = np.random.RandomState(123456)
 file_index = np.arange(n_files)
 rand.shuffle(file_index)
+train_index = file_index[:-640*2]
+val_index = file_index[-640*2:-640]
 test_index = file_index[-640:]
-train_index = file_index[:-640]
 
 batch_size = 64
 train_dataset = LibriSpeechDataset(manifest_filepath_p, librispeech_path, 3, index=train_index,
                                    manifest_filepath_w=manifest_filepath_w)
 train_sampler = BucketingSampler(train_dataset, batch_size=batch_size)
 train_loader = DataLoader(train_dataset, num_workers=1, batch_sampler=train_sampler)
+
+val_dataset = LibriSpeechDataset(manifest_filepath_p, librispeech_path, 3, index=val_index, train=False,
+                                  manifest_filepath_w=manifest_filepath_w)
+val_sampler = BucketingSampler(val_dataset, batch_size=batch_size)
+val_loader = DataLoader(val_dataset, num_workers=1, batch_sampler=val_sampler)
+
 test_dataset = LibriSpeechDataset(manifest_filepath_p, librispeech_path, 3, index=test_index, train=False,
                                   manifest_filepath_w=manifest_filepath_w)
 test_sampler = BucketingSampler(test_dataset, batch_size=batch_size)
@@ -324,11 +353,11 @@ else:
 optimizer = optim.Adam(model.parameters(), lr=lr0)
 n_batch = int(len(train_dataset)/batch_size)
 
-train_loss, test_loss, test_accuracy = ([], [], [])
+train_loss, val_loss, val_accuracy = ([], [], [])
 best_val_losses = [0. for ii in range(model.n_losses)]
 for epoch in range(70):
     logger.info('Epoch {}'.format(epoch))
-    [l.append([]) for l in [train_loss, test_loss, test_accuracy]]
+    [l.append([]) for l in [train_loss, val_loss, val_accuracy]]
 
     model.train()
     avg_losses = [0. for ii in range(model.n_losses)]
@@ -360,38 +389,20 @@ for epoch in range(70):
         if (i>0) and (i%20==0):
             logger.info('Batch {} of {}'.format(i, n_batch))
             for i_loss, avg_loss in enumerate(avg_losses):
-                logger.info('Average loss {}: {}'.format(i_loss, avg_loss/i))
+                logger.info('Average loss {}: {}'.format(i_loss, avg_loss/(i+1)))
             logger.info('Elapsed time: {} seconds'.format(time()-epoch_start))
 
     for i_loss, avg_loss in enumerate(avg_losses):
         train_loss[-1].append(avg_loss/i)
 
-    model.eval()
-    avg_losses = [0. for ii in range(model.n_losses)]
-    avg_accuracies = [0. for ii in range(model.n_losses)]
-    epoch_start = time()
-    logger.info('Testing..')
-    for i, (data) in enumerate(test_loader, start=0):
-
-        logger.info(i)
-        data = (data[0].to(device), tuple([d.to(device) for d in data[1]]))
-        y, targets = data
-        spec = mel(y)
-        spec = amplitude_to_db(spec)
-        if is_modfilter:
-            spec = modfilter(spec)
-        out = model(spec)
-        losses = model.loss(out, targets)
-        accuracies = model.accuracy(out, targets)
-        avg_losses = [al+l.item() for al, l  in zip(avg_losses, losses)]
-        avg_accuracies = [aa+a for aa, a  in zip(avg_accuracies, accuracies)]
+    avg_losses, avg_accuracies, i = evaluate(val_loader)
 
     is_best = False
     for i_loss, (avg_loss, avg_accuracy) in enumerate(zip(avg_losses, avg_accuracies)):
-        logger.info('Test loss {}: {}'.format(i_loss, avg_loss/(i+1)))
-        logger.info('Test accuracy {}: {}'.format(i_loss, avg_accuracy/(i+1)))
-        test_loss[-1].append(avg_loss/(i+1))
-        test_accuracy[-1].append(avg_accuracy/(i+1))
+        logger.info('Validation loss {}: {}'.format(i_loss, avg_loss/(i+1)))
+        logger.info('Validation accuracy {}: {}'.format(i_loss, avg_accuracy/(i+1)))
+        val_loss[-1].append(avg_loss/(i+1))
+        val_accuracy[-1].append(avg_accuracy/(i+1))
         if (epoch==0) or (avg_loss/(i+1) < best_val_losses[i_loss]):
             best_val_losses[i_loss] = avg_loss/(i+1)
             is_best = True
@@ -406,7 +417,17 @@ for epoch in range(70):
         for g in optimizer.param_groups:
             g['lr'] /= 4
 
+# Test
+avg_losses, avg_accuracies, i = evaluate(test_loader)
+for i_loss in range(len(avg_losses)):
+    logger.info('Test loss {}: {}'.format(i_loss, avg_loss/(i+1)))
+    logger.info('Test accuracy {}: {}'.format(i_loss, avg_accuracy/(i+1)))
+    avg_losses[i_loss] = avg_losses[i_loss]/(i+1)
+    avg_accuracies[i_loss] = avg_accuracies[i_loss]/(i+1)
+            
 np.savez('./results_{}.npz'.format(experiment_string),
     train_loss=np.array(train_loss),
-    test_loss=np.array(test_loss),
-    test_accuracy=np.array(test_accuracy))
+    val_loss=np.array(val_loss),
+    val_accuracy=np.array(val_accuracy)),
+    test_loss=np.array(avg_losses),
+    test_accuracy=np.array(avg_accuracies))
