@@ -428,6 +428,6 @@ for i_loss in range(len(avg_losses)):
 np.savez('./results_{}.npz'.format(experiment_string),
     train_loss=np.array(train_loss),
     val_loss=np.array(val_loss),
-    val_accuracy=np.array(val_accuracy)),
+    val_accuracy=np.array(val_accuracy),
     test_loss=np.array(avg_losses),
     test_accuracy=np.array(avg_accuracies))
