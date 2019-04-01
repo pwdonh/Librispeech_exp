@@ -1,14 +1,3 @@
-#!/usr/bin/env python
-# coding: utf-8
-
-# In[1]:
-
-
-# cd speechsamples/voxceleb_exp
-
-
-# In[76]:
-
 
 import numpy as np
 import torch
@@ -49,6 +38,8 @@ parser.add_argument('--cutoff-spec', type=int,
                     help='path to test manifest csv', default=0)
 parser.add_argument('--rndseed', type=int,
                     help='path to test manifest csv', default=20102018)
+parser.add_argument('--n-train', type=int,
+                    help='path to test manifest csv', default=25817)
 parser.add_argument('--cuda', dest='cuda', action='store_true', help='Use cuda to train model')
 args = parser.parse_args()
 
@@ -61,6 +52,10 @@ args = parser.parse_args()
 # n_future_w = 0
 # speakers = False
 # rndseed = 20102018
+# n_train = 25817
+# n_train = 8640
+# ii = 1
+
 basepath = args.basepath
 lr0 = args.lrate
 n_future_p = args.n_future_p
@@ -70,6 +65,7 @@ cutoff_temp = args.cutoff_temp
 cutoff_spec = args.cutoff_spec
 cuda = args.cuda
 rndseed = args.rndseed
+n_train = args.n_train
 
 manifest_filepath = './converted_aligned_phones.txt'
 librispeech_path = basepath+'/LibriSpeech/train-clean-100/'
@@ -82,12 +78,12 @@ torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 np.random.seed(rndseed)
 
-experiment_string = 'lr_{}_nfuturep_{}_nfuturew_{}_speakers_{}_ctemp_{}_cspec_{}_0'.format(
-    int(lr0*10000), n_future_p, n_future_w, speakers, cutoff_temp, cutoff_spec)
-ii = 1
-while os.path.isfile('log_'+experiment_string+'.log'):
-    experiment_string = experiment_string[:-1]+str(ii)
-    ii +=1
+experiment_string = 'lr_{}_nfuturep_{}_nfuturew_{}_speakers_{}_ctemp_{}_cspec_{}_ntrain_{}_{}'.format(
+    int(lr0*10000), n_future_p, n_future_w, speakers, cutoff_temp, cutoff_spec, n_train, rndseed)
+# ii = 1
+# while os.path.isfile('log_'+experiment_string+'.log'):
+#     experiment_string = experiment_string[:-1]+str(ii)
+#     ii +=1
 logging.basicConfig(filename='log_{}.log'.format(experiment_string), filemode='w', format='%(name)s - %(levelname)s - %(message)s',
                     level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -270,7 +266,44 @@ def amplitude_to_db(x, ref=1.0, amin=1e-7):
     x = torch.clamp(x, min=amin)
     return 10.0 * (torch.log10(x) - torch.log10(torch.tensor(ref, device=x.device, requires_grad=False)))
 
-def evaluate(loader):  
+def train(loader):
+
+    model.train()
+    avg_losses = [0. for ii in range(model.n_losses)]
+    epoch_start = time()
+    train_sampler.shuffle(epoch)
+
+    for i, (data) in enumerate(train_loader, start=0):
+
+        data = (data[0].to(device), tuple([d.to(device) for d in data[1]]))
+        # get audio signal and multiple targets
+        y, targets = data
+        # compute mel-spectrogram
+        spec = mel(y)
+        spec = amplitude_to_db(spec)
+        # apply modulation filter
+        if is_modfilter:
+            spec = modfilter(spec)
+        # run through CNN/RNN
+        out = model(spec)
+        # compute losses
+        losses = model.loss(out, targets)
+        avg_losses = [al+l.item() for al, l  in zip(avg_losses, losses)]
+        # compute gradient wrt summed losses
+        optimizer.zero_grad()
+        sum(losses).backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        optimizer.step()
+
+        if (i>0) and (i%20==0):
+            logger.info('Batch {} of {}'.format(i, n_batch))
+            for i_loss, avg_loss in enumerate(avg_losses):
+                logger.info('Average loss {}: {}'.format(i_loss, avg_loss/(i+1)))
+            logger.info('Elapsed time: {} seconds'.format(time()-epoch_start))
+
+    return avg_losses, i
+
+def evaluate(loader):
     model.eval()
     avg_losses = [0. for ii in range(model.n_losses)]
     avg_accuracies = [0. for ii in range(model.n_losses)]
@@ -291,17 +324,18 @@ def evaluate(loader):
         avg_losses = [al+l.item() for al, l  in zip(avg_losses, losses)]
         avg_accuracies = [aa+a for aa, a  in zip(avg_accuracies, accuracies)]
     return avg_losses, avg_accuracies, i
-  
+
 # ==== Load data ==== #
 
 train_dataset = LibriSpeechDataset(manifest_filepath_p, librispeech_path, 3, index=None,
                                    manifest_filepath_w=manifest_filepath_w)
 n_files = len(train_dataset)
 
-rand = np.random.RandomState(123456)
+rand = np.random.RandomState(20102018)
 file_index = np.arange(n_files)
 rand.shuffle(file_index)
 train_index = file_index[:-640*2]
+train_index = file_index[:n_train]
 val_index = file_index[-640*2:-640]
 test_index = file_index[-640:]
 
@@ -358,45 +392,13 @@ best_val_losses = [0. for ii in range(model.n_losses)]
 for epoch in range(70):
     logger.info('Epoch {}'.format(epoch))
     [l.append([]) for l in [train_loss, val_loss, val_accuracy]]
-
-    model.train()
-    avg_losses = [0. for ii in range(model.n_losses)]
-    epoch_start = time()
-    train_sampler.shuffle(epoch)
-
-    for i, (data) in enumerate(train_loader, start=0):
-
-        data = (data[0].to(device), tuple([d.to(device) for d in data[1]]))
-        # get audio signal and multiple targets
-        y, targets = data
-        # compute mel-spectrogram
-        spec = mel(y)
-        spec = amplitude_to_db(spec)
-        # apply modulation filter
-        if is_modfilter:
-            spec = modfilter(spec)
-        # run through CNN/RNN
-        out = model(spec)
-        # compute losses
-        losses = model.loss(out, targets)
-        avg_losses = [al+l.item() for al, l  in zip(avg_losses, losses)]
-        # compute gradient wrt summed losses
-        optimizer.zero_grad()
-        sum(losses).backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-        optimizer.step()
-
-        if (i>0) and (i%20==0):
-            logger.info('Batch {} of {}'.format(i, n_batch))
-            for i_loss, avg_loss in enumerate(avg_losses):
-                logger.info('Average loss {}: {}'.format(i_loss, avg_loss/(i+1)))
-            logger.info('Elapsed time: {} seconds'.format(time()-epoch_start))
-
+    # Training loop
+    avg_losses, i = train(train_loader)
     for i_loss, avg_loss in enumerate(avg_losses):
-        train_loss[-1].append(avg_loss/i)
-
+        train_loss[-1].append(avg_loss/(i+1))
+    # Validation loop
     avg_losses, avg_accuracies, i = evaluate(val_loader)
-
+    # Check whether to save the current model, or decrease the learning rate
     is_best = False
     for i_loss, (avg_loss, avg_accuracy) in enumerate(zip(avg_losses, avg_accuracies)):
         logger.info('Validation loss {}: {}'.format(i_loss, avg_loss/(i+1)))
@@ -406,7 +408,6 @@ for epoch in range(70):
         if (epoch==0) or (avg_loss/(i+1) < best_val_losses[i_loss]):
             best_val_losses[i_loss] = avg_loss/(i+1)
             is_best = True
-
     if is_best:
         logger.info('Saving model')
         with open('./state_dict_{}.pkl'.format(experiment_string), 'wb') as f:
@@ -423,8 +424,8 @@ for i_loss in range(len(avg_losses)):
     avg_losses[i_loss] = avg_losses[i_loss]/(i+1)
     avg_accuracies[i_loss] = avg_accuracies[i_loss]/(i+1)
     logger.info('Test loss {}: {}'.format(i_loss, avg_losses[i_loss]))
-    logger.info('Test accuracy {}: {}'.format(i_loss, avg_accuracies[i_loss]))    
-            
+    logger.info('Test accuracy {}: {}'.format(i_loss, avg_accuracies[i_loss]))
+
 np.savez('./results_{}.npz'.format(experiment_string),
     train_loss=np.array(train_loss),
     val_loss=np.array(val_loss),
